@@ -10,6 +10,8 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Tuple
 from urllib.parse import urlparse
+import json
+import hashlib
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -201,6 +203,58 @@ class IceRunnerConnector:
             logger.error(f"Error executing SQL: {e}")
             raise
 
+    def get_current_snapshot_id(self, table_name: str) -> Optional[int]:
+        """Get the current snapshot ID for a table if it exists."""
+        full_table_name = f"{ICERUNNER_NAMESPACE}.{table_name}"
+
+        try:
+            if self.catalog.table_exists(full_table_name):
+                iceberg_table = self.catalog.load_table(full_table_name)
+                current_snapshot = iceberg_table.current_snapshot()
+                if current_snapshot:
+                    return current_snapshot.snapshot_id
+            return None
+        except Exception as e:
+            logger.error(f"Error getting snapshot ID for {table_name}: {e}")
+            return None
+
+    def get_changes_since_snapshot(
+        self, table_name: str, snapshot_id: int
+    ) -> Optional[pa.Table]:
+        """Get changes since the specified snapshot ID."""
+        full_table_name = f"{ICERUNNER_NAMESPACE}.{table_name}"
+
+        try:
+            if not self.catalog.table_exists(full_table_name):
+                return None
+
+            iceberg_table = self.catalog.load_table(full_table_name)
+            current_snapshot = iceberg_table.current_snapshot()
+
+            if not current_snapshot or current_snapshot.snapshot_id == snapshot_id:
+                # No changes since the specified snapshot
+                return None
+
+            # Get the changes between snapshots using DuckDB's iceberg_snapshots function
+            self._reflect_views()
+            changes = self.con.execute(
+                f"""
+                WITH snapshot_data AS (
+                    SELECT * FROM iceberg_snapshots('{self.warehouse_path}/{ICERUNNER_NAMESPACE}.db/{table_name}')
+                )
+                SELECT s.* 
+                FROM {table_name} s
+                JOIN snapshot_data sd ON sd.snapshot_id > {snapshot_id} AND sd.snapshot_id <= {current_snapshot.snapshot_id}
+            """
+            ).fetch_arrow_table()
+
+            return changes
+        except Exception as e:
+            logger.error(
+                f"Error getting changes for {table_name} since snapshot {snapshot_id}: {e}"
+            )
+            return None
+
 
 class IceRunnerFlightServer(flight.FlightServerBase):
     """
@@ -387,6 +441,49 @@ def get_remote_tables(client: flight.FlightClient) -> List[str]:
             return []
 
 
+class SyncState:
+    """Class to track sync state between source and target tables."""
+
+    def __init__(self, warehouse_path: str):
+        self.warehouse_path = Path(warehouse_path).absolute()
+        self.state_dir = self.warehouse_path / "sync_state"
+        os.makedirs(self.state_dir, exist_ok=True)
+
+    def get_state_path(self, source_url: str, target_table: str) -> Path:
+        """Get the path to the state file for a specific sync pair."""
+        # Create a deterministic filename from the source and target
+        source_hash = hashlib.md5(source_url.encode()).hexdigest()[:8]
+        return self.state_dir / f"{source_hash}_{target_table}.json"
+
+    def get_last_sync_state(self, source_url: str, target_table: str) -> dict:
+        """Get the last sync state for a source-target pair."""
+        state_path = self.get_state_path(source_url, target_table)
+        if state_path.exists():
+            try:
+                with open(state_path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error reading sync state: {e}")
+
+        # Return default state if no state file exists or on error
+        return {
+            "last_sync_time": None,
+            "source_snapshot_id": None,
+            "target_snapshot_id": None,
+            "rows_synced": 0,
+            "last_sync_status": "never_run",
+        }
+
+    def save_sync_state(self, source_url: str, target_table: str, state: dict) -> None:
+        """Save the sync state for a source-target pair."""
+        state_path = self.get_state_path(source_url, target_table)
+        try:
+            with open(state_path, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving sync state: {e}")
+
+
 def run_mirror(
     source_url: str,
     target_table: str,
@@ -434,6 +531,9 @@ def run_mirror(
     # Set up local connector for target table
     connector = IceRunnerConnector(warehouse_path)
 
+    # Set up sync state tracking
+    sync_state = SyncState(warehouse_path)
+
     # Initialize counters for stats
     total_rows_synced = 0
     start_time = time.time()
@@ -447,6 +547,10 @@ def run_mirror(
         logger.info(
             f"Starting sync #{sync_count+1} from {source_url}/{source_table} to local table {target_table}"
         )
+
+        # Get last sync state
+        last_state = sync_state.get_last_sync_state(source_url, target_table)
+        last_source_snapshot_id = last_state.get("source_snapshot_id")
 
         try:
             # Get data from source Flight server
@@ -470,90 +574,162 @@ def run_mirror(
             else:
                 endpoint_client = source_client
 
-            # Read data from the source
-            reader = endpoint_client.do_get(endpoint.ticket)
-            schema = reader.schema
-
-            # Create the target table if it doesn't exist
+            # Check if target table exists and create it if needed
             table_exists = target_table in connector.tables
 
             if not table_exists:
+                # For new tables, we need to create it with the source schema
                 # Get the first batch to determine schema
-                batch = reader.read_next_batch()
-                if batch is None:
-                    logger.warning("Source table is empty, nothing to sync")
-                    return
+                try:
+                    # Try to get schema information first, if the server supports it
+                    cmd = {"command": "get_schema", "table": source_table}
+                    schema_info = endpoint_client.get_flight_info(
+                        flight.FlightDescriptor.for_command(json.dumps(cmd).encode())
+                    )
+                    schema_reader = endpoint_client.do_get(
+                        schema_info.endpoints[0].ticket
+                    )
+                    schema_batch = schema_reader.read_next_batch()
+                    sample_table = pa.Table.from_batches([schema_batch])
+                except:
+                    # Fallback: get actual data to determine schema
+                    reader = endpoint_client.do_get(endpoint.ticket)
+                    batch = reader.read_next_batch()
+                    if batch is None:
+                        logger.warning("Source table is empty, nothing to sync")
+                        return
+                    sample_table = pa.Table.from_batches([batch])
 
-                sample_table = pa.Table.from_batches([batch])
+                # Create the target table with the source schema
                 connector.create_table(target_table, sample_table)
-
-                # Start inserting from the first batch
-                total_rows_synced += len(sample_table)
-                connector.insert(target_table, sample_table)
                 logger.info(
-                    f"Created target table {target_table} and inserted {len(sample_table)} rows"
+                    f"Created target table {target_table} with schema from source"
                 )
 
-                # Process remaining batches
-                batch_count = 1
-                rows_in_batch = 0
-                batches = []
+                # Now do a full data sync since it's a new table
+                reader = endpoint_client.do_get(endpoint.ticket)
+                rows_synced = process_batches(
+                    reader, connector, target_table, batch_size
+                )
+                total_rows_synced += rows_synced
 
-                for next_batch in reader:
-                    batches.append(next_batch)
-                    rows_in_batch += len(next_batch)
+                # Save the state after successful sync
+                current_target_snapshot_id = connector.get_current_snapshot_id(
+                    target_table
+                )
+                new_state = {
+                    "last_sync_time": datetime.now().isoformat(),
+                    "source_snapshot_id": "full_sync",  # We don't know the source snapshot ID yet
+                    "target_snapshot_id": current_target_snapshot_id,
+                    "rows_synced": rows_synced,
+                    "last_sync_status": "success",
+                }
+                sync_state.save_sync_state(source_url, target_table, new_state)
 
-                    if len(batches) >= batch_size:
-                        batch_table = pa.Table.from_batches(batches)
-                        connector.insert(target_table, batch_table)
-                        total_rows_synced += rows_in_batch
-                        logger.info(
-                            f"Inserted batch {batch_count}: {rows_in_batch} rows"
-                        )
-                        batches = []
-                        rows_in_batch = 0
-                        batch_count += 1
-
-                # Insert any remaining batches
-                if batches:
-                    batch_table = pa.Table.from_batches(batches)
-                    connector.insert(target_table, batch_table)
-                    total_rows_synced += rows_in_batch
-                    logger.info(
-                        f"Inserted final batch {batch_count}: {rows_in_batch} rows"
-                    )
+                logger.info(
+                    f"Initial sync completed: {rows_synced} rows synced to new table {target_table}"
+                )
             else:
-                # Table exists, need to determine what records to sync
-                # For simplicity, we'll just sync all records
-                # In a real implementation, you would track last sync point and only sync new records
-
-                batches = []
-                rows_in_batch = 0
-                batch_count = 0
-
-                for batch in reader:
-                    batches.append(batch)
-                    rows_in_batch += len(batch)
-
-                    if len(batches) >= batch_size:
-                        batch_table = pa.Table.from_batches(batches)
-                        connector.insert(target_table, batch_table)
-                        total_rows_synced += rows_in_batch
-                        logger.info(
-                            f"Inserted batch {batch_count}: {rows_in_batch} rows"
+                # Table exists, we need to determine what records to sync
+                if last_source_snapshot_id:
+                    # Try to use snapshot-based incremental sync if possible
+                    try:
+                        # Query for changes since last sync using snapshot metadata
+                        cmd = {
+                            "command": "get_changes",
+                            "table": source_table,
+                            "snapshot_id": last_source_snapshot_id,
+                        }
+                        changes_info = endpoint_client.get_flight_info(
+                            flight.FlightDescriptor.for_command(
+                                json.dumps(cmd).encode()
+                            )
                         )
-                        batches = []
-                        rows_in_batch = 0
-                        batch_count += 1
 
-                # Insert any remaining batches
-                if batches:
-                    batch_table = pa.Table.from_batches(batches)
-                    connector.insert(target_table, batch_table)
-                    total_rows_synced += rows_in_batch
-                    logger.info(
-                        f"Inserted final batch {batch_count}: {rows_in_batch} rows"
+                        if changes_info.endpoints:
+                            # Server supports incremental sync
+                            logger.info(
+                                f"Performing incremental sync since snapshot {last_source_snapshot_id}"
+                            )
+                            changes_reader = endpoint_client.do_get(
+                                changes_info.endpoints[0].ticket
+                            )
+                            rows_synced = process_batches(
+                                changes_reader, connector, target_table, batch_size
+                            )
+
+                            # Get current source snapshot ID
+                            source_metadata_cmd = {
+                                "command": "get_metadata",
+                                "table": source_table,
+                            }
+                            metadata_info = endpoint_client.get_flight_info(
+                                flight.FlightDescriptor.for_command(
+                                    json.dumps(source_metadata_cmd).encode()
+                                )
+                            )
+                            metadata_reader = endpoint_client.do_get(
+                                metadata_info.endpoints[0].ticket
+                            )
+                            metadata = metadata_reader.read_all().to_pydict()
+                            current_source_snapshot_id = metadata.get(
+                                "snapshot_id", "unknown"
+                            )
+
+                            logger.info(
+                                f"Incremental sync completed: {rows_synced} rows synced"
+                            )
+                        else:
+                            # Server doesn't support incremental sync, fall back to full sync
+                            logger.info(
+                                "Server doesn't support incremental sync, falling back to full sync"
+                            )
+                            reader = endpoint_client.do_get(endpoint.ticket)
+                            rows_synced = process_batches(
+                                reader, connector, target_table, batch_size
+                            )
+                            current_source_snapshot_id = "full_sync"
+
+                            logger.info(
+                                f"Full sync completed: {rows_synced} rows synced"
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"Error during incremental sync: {e}, falling back to full sync"
+                        )
+                        reader = endpoint_client.do_get(endpoint.ticket)
+                        rows_synced = process_batches(
+                            reader, connector, target_table, batch_size
+                        )
+                        current_source_snapshot_id = "full_sync"
+
+                        logger.info(f"Full sync completed: {rows_synced} rows synced")
+                else:
+                    # No previous sync state, do a full sync
+                    logger.info(f"No previous sync state found, performing full sync")
+                    reader = endpoint_client.do_get(endpoint.ticket)
+                    rows_synced = process_batches(
+                        reader, connector, target_table, batch_size
                     )
+                    current_source_snapshot_id = "full_sync"
+
+                    logger.info(f"Full sync completed: {rows_synced} rows synced")
+
+                # Update the total rows synced
+                total_rows_synced += rows_synced
+
+                # Save the state after successful sync
+                current_target_snapshot_id = connector.get_current_snapshot_id(
+                    target_table
+                )
+                new_state = {
+                    "last_sync_time": datetime.now().isoformat(),
+                    "source_snapshot_id": current_source_snapshot_id,
+                    "target_snapshot_id": current_target_snapshot_id,
+                    "rows_synced": rows_synced,
+                    "last_sync_status": "success",
+                }
+                sync_state.save_sync_state(source_url, target_table, new_state)
 
             sync_count += 1
             sync_duration = time.time() - sync_start
@@ -561,6 +737,41 @@ def run_mirror(
 
         except Exception as e:
             logger.error(f"Error during sync: {e}")
+
+            # Save error state
+            error_state = sync_state.get_last_sync_state(source_url, target_table)
+            error_state["last_sync_time"] = datetime.now().isoformat()
+            error_state["last_sync_status"] = f"error: {str(e)}"
+            sync_state.save_sync_state(source_url, target_table, error_state)
+
+    def process_batches(reader, connector, table_name, batch_size):
+        """Process batches from a reader and insert them into a table."""
+        batches = []
+        rows_in_batch = 0
+        batch_count = 0
+        total_rows = 0
+
+        for batch in reader:
+            batches.append(batch)
+            rows_in_batch += len(batch)
+
+            if len(batches) >= batch_size:
+                batch_table = pa.Table.from_batches(batches)
+                connector.insert(table_name, batch_table)
+                total_rows += rows_in_batch
+                logger.info(f"Inserted batch {batch_count}: {rows_in_batch} rows")
+                batches = []
+                rows_in_batch = 0
+                batch_count += 1
+
+        # Insert any remaining batches
+        if batches:
+            batch_table = pa.Table.from_batches(batches)
+            connector.insert(table_name, batch_table)
+            total_rows += rows_in_batch
+            logger.info(f"Inserted final batch {batch_count}: {rows_in_batch} rows")
+
+        return total_rows
 
     # Perform initial sync
     perform_sync()
