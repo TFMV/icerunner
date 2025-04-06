@@ -33,7 +33,7 @@ logger = logging.getLogger("icerunner")
 # Global icerunner constants
 ICERUNNER_WAREHOUSE_PATH = "warehouse"
 ICERUNNER_PORT = 8816
-ICERUNNER_TABLE_NAME = "concurrent_test"
+ICERUNNER_TABLE_NAME = "icerunner_test"
 ICERUNNER_NAMESPACE = "default"
 
 
