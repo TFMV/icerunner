@@ -1,3 +1,4 @@
 pyarrow
 pyiceberg[sql-sqlite]
 duckdb
+faker

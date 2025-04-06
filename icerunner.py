@@ -672,11 +672,28 @@ def run_server(warehouse_path: str, table_name: str, port: int):
         location = flight.Location.for_grpc_tcp("localhost", port)
         server = IceRunnerFlightServer(location, warehouse_path)
 
-        # Create initial table if it doesn't exist
-        sample_table = create_sample_table()
-
+        # Create initial tables with different data profiles if they don't exist
         if table_name not in server.connector.tables:
+            logger.info(
+                f"Creating sample table {table_name} with analytics data profile"
+            )
+            sample_table = create_sample_table(num_rows=200, data_profile="analytics")
             server.connector.create_table(table_name, sample_table)
+
+        # Create additional demo tables with other data profiles
+        demo_tables = {
+            f"{table_name}_events": "events",
+            f"{table_name}_sales": "sales",
+            f"{table_name}_iot": "iot",
+        }
+
+        for demo_table, profile in demo_tables.items():
+            if demo_table not in server.connector.tables:
+                logger.info(
+                    f"Creating demo table {demo_table} with {profile} data profile"
+                )
+                demo_data = create_sample_table(num_rows=100, data_profile=profile)
+                server.connector.create_table(demo_table, demo_data)
 
         # Start the server in a new thread
         server_thread = threading.Thread(target=server.serve)
@@ -684,6 +701,7 @@ def run_server(warehouse_path: str, table_name: str, port: int):
         server_thread.start()
 
         logger.info(f"Flight server started at grpc://localhost:{port}")
+        logger.info(f"Available tables: {[table_name] + list(demo_tables.keys())}")
         try:
             while True:
                 time.sleep(1)
