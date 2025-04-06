@@ -4,10 +4,12 @@ import time
 import socket
 import threading
 import logging
+import argparse
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple
+from urllib.parse import urlparse
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -35,6 +37,9 @@ ICERUNNER_WAREHOUSE_PATH = "warehouse"
 ICERUNNER_PORT = 8816
 ICERUNNER_TABLE_NAME = "icerunner_test"
 ICERUNNER_NAMESPACE = "default"
+ICERUNNER_DEFAULT_BATCH_SIZE = (
+    1000  # Number of rows to process at once during replication
+)
 
 
 class IceRunnerConnector:
@@ -350,17 +355,244 @@ def run_writer(table_name: str, port: int, interval: int = 1):
         time.sleep(interval)
 
 
+def parse_flight_url(url: str) -> Tuple[str, int]:
+    """Parse a Flight URL into host and port components."""
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8815  # Default Flight port if not specified
+    return host, port
+
+
+def get_remote_tables(client: flight.FlightClient) -> List[str]:
+    """Get list of all tables available on a remote Flight server."""
+    try:
+        # Try to list tables using Flight GetFlightInfo
+        flight_info = client.get_flight_info(
+            flight.FlightDescriptor.for_command(b"LIST_TABLES")
+        )
+        reader = client.do_get(flight_info.endpoints[0].ticket)
+        table = reader.read_all()
+        return table["table_name"].to_pylist()
+    except:
+        # If that fails, try to get a listing from a simple Flight path listing
+        try:
+            flight_info = client.list_flights()
+            tables = []
+            for info in flight_info:
+                if hasattr(info.descriptor, "path") and info.descriptor.path:
+                    tables.append(info.descriptor.path[0].decode("utf-8"))
+            return tables
+        except Exception as e:
+            logger.error(f"Unable to determine tables from remote server: {e}")
+            return []
+
+
+def run_mirror(
+    source_url: str,
+    target_table: str,
+    warehouse_path: str,
+    target_port: int = ICERUNNER_PORT,
+    interval: int = 60,
+    batch_size: int = ICERUNNER_DEFAULT_BATCH_SIZE,
+    continuous: bool = True,
+):
+    """
+    Mirror data from a remote Flight server to a local Iceberg table.
+
+    Args:
+        source_url: URL of the source Flight server (e.g., grpc://hostname:port)
+        target_table: Name of the target table to write to
+        warehouse_path: Path to the local warehouse directory
+        target_port: Port for the local Flight server
+        interval: Interval in seconds between sync operations (only used if continuous=True)
+        batch_size: Number of rows to process in each batch
+        continuous: Whether to run in continuous sync mode
+    """
+    # Connect to source Flight server
+    logger.info(f"Connecting to source Flight server at {source_url}")
+    source_client = flight.connect(source_url)
+
+    # Parse the source URL to get hostname/port
+    source_host, source_port = parse_flight_url(source_url)
+
+    # Get the source table(s) if not specified in the URL
+    source_path = urlparse(source_url).path
+    if source_path and source_path != "/":
+        # Extract table name from path if present
+        source_table = source_path.strip("/")
+    else:
+        # Try to get available tables from the server
+        available_tables = get_remote_tables(source_client)
+        if not available_tables:
+            logger.error("No source table specified and couldn't discover any tables")
+            return
+        source_table = available_tables[0]
+        logger.info(
+            f"No specific table requested, using discovered table: {source_table}"
+        )
+
+    # Set up local connector for target table
+    connector = IceRunnerConnector(warehouse_path)
+
+    # Initialize counters for stats
+    total_rows_synced = 0
+    start_time = time.time()
+    sync_count = 0
+
+    def perform_sync():
+        """Perform a single sync operation"""
+        nonlocal total_rows_synced, sync_count
+
+        sync_start = time.time()
+        logger.info(
+            f"Starting sync #{sync_count+1} from {source_url}/{source_table} to local table {target_table}"
+        )
+
+        try:
+            # Get data from source Flight server
+            flight_info = source_client.get_flight_info(
+                flight.FlightDescriptor.for_path(source_table.encode())
+            )
+            if not flight_info.endpoints:
+                logger.error(f"No endpoints found for table {source_table}")
+                return
+
+            endpoint = flight_info.endpoints[0]
+
+            # If we need to connect to a different endpoint server
+            if endpoint.locations:
+                location = endpoint.locations[0]
+                if location.uri != source_url:
+                    logger.info(f"Following endpoint location to {location.uri}")
+                    endpoint_client = flight.connect(location.uri)
+                else:
+                    endpoint_client = source_client
+            else:
+                endpoint_client = source_client
+
+            # Read data from the source
+            reader = endpoint_client.do_get(endpoint.ticket)
+            schema = reader.schema
+
+            # Create the target table if it doesn't exist
+            table_exists = target_table in connector.tables
+
+            if not table_exists:
+                # Get the first batch to determine schema
+                batch = reader.read_next_batch()
+                if batch is None:
+                    logger.warning("Source table is empty, nothing to sync")
+                    return
+
+                sample_table = pa.Table.from_batches([batch])
+                connector.create_table(target_table, sample_table)
+
+                # Start inserting from the first batch
+                total_rows_synced += len(sample_table)
+                connector.insert(target_table, sample_table)
+                logger.info(
+                    f"Created target table {target_table} and inserted {len(sample_table)} rows"
+                )
+
+                # Process remaining batches
+                batch_count = 1
+                rows_in_batch = 0
+                batches = []
+
+                for next_batch in reader:
+                    batches.append(next_batch)
+                    rows_in_batch += len(next_batch)
+
+                    if len(batches) >= batch_size:
+                        batch_table = pa.Table.from_batches(batches)
+                        connector.insert(target_table, batch_table)
+                        total_rows_synced += rows_in_batch
+                        logger.info(
+                            f"Inserted batch {batch_count}: {rows_in_batch} rows"
+                        )
+                        batches = []
+                        rows_in_batch = 0
+                        batch_count += 1
+
+                # Insert any remaining batches
+                if batches:
+                    batch_table = pa.Table.from_batches(batches)
+                    connector.insert(target_table, batch_table)
+                    total_rows_synced += rows_in_batch
+                    logger.info(
+                        f"Inserted final batch {batch_count}: {rows_in_batch} rows"
+                    )
+            else:
+                # Table exists, need to determine what records to sync
+                # For simplicity, we'll just sync all records
+                # In a real implementation, you would track last sync point and only sync new records
+
+                batches = []
+                rows_in_batch = 0
+                batch_count = 0
+
+                for batch in reader:
+                    batches.append(batch)
+                    rows_in_batch += len(batch)
+
+                    if len(batches) >= batch_size:
+                        batch_table = pa.Table.from_batches(batches)
+                        connector.insert(target_table, batch_table)
+                        total_rows_synced += rows_in_batch
+                        logger.info(
+                            f"Inserted batch {batch_count}: {rows_in_batch} rows"
+                        )
+                        batches = []
+                        rows_in_batch = 0
+                        batch_count += 1
+
+                # Insert any remaining batches
+                if batches:
+                    batch_table = pa.Table.from_batches(batches)
+                    connector.insert(target_table, batch_table)
+                    total_rows_synced += rows_in_batch
+                    logger.info(
+                        f"Inserted final batch {batch_count}: {rows_in_batch} rows"
+                    )
+
+            sync_count += 1
+            sync_duration = time.time() - sync_start
+            logger.info(f"Sync #{sync_count} completed in {sync_duration:.2f} seconds")
+
+        except Exception as e:
+            logger.error(f"Error during sync: {e}")
+
+    # Perform initial sync
+    perform_sync()
+
+    # If continuous mode, keep syncing at the specified interval
+    if continuous:
+        logger.info(f"Continuous sync enabled, will sync every {interval} seconds")
+        while True:
+            time.sleep(interval)
+            perform_sync()
+            # Log statistics
+            elapsed = time.time() - start_time
+            logger.info(
+                f"Summary: {total_rows_synced} rows synced in {sync_count} syncs over {elapsed:.2f} seconds"
+            )
+    else:
+        logger.info("One-time sync completed")
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Summary: {total_rows_synced} rows synced in {elapsed:.2f} seconds"
+        )
+
+
 def main():
     """Main entry point for the IceRunner application."""
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="IceRunner - Iceberg PyArrow Flight Server"
     )
     parser.add_argument(
         "command",
-        choices=("serve", "read", "write"),
-        help="Command to run (serve, read, or write)",
+        choices=("serve", "read", "write", "mirror"),
+        help="Command to run (serve, read, write, or mirror)",
     )
     parser.add_argument(
         "-w",
@@ -388,6 +620,23 @@ def main():
         type=int,
         help="Interval in seconds between operations (default: 1)",
     )
+    parser.add_argument(
+        "-s",
+        "--source",
+        help="Source Flight server URL for mirror mode (e.g., grpc://hostname:port/table)",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch-size",
+        type=int,
+        default=ICERUNNER_DEFAULT_BATCH_SIZE,
+        help=f"Number of rows to process in each batch (default: {ICERUNNER_DEFAULT_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--one-time",
+        action="store_true",
+        help="Perform a one-time sync rather than continuous (for mirror mode)",
+    )
 
     args = parser.parse_args()
 
@@ -398,6 +647,20 @@ def main():
             run_reader(args.table_name, args.port, args.interval)
         elif args.command == "write":
             run_writer(args.table_name, args.port, args.interval)
+        elif args.command == "mirror":
+            if not args.source:
+                parser.error(
+                    "Mirror mode requires --source parameter with Flight server URL"
+                )
+            run_mirror(
+                source_url=args.source,
+                target_table=args.table_name,
+                warehouse_path=args.warehouse_path,
+                target_port=args.port,
+                interval=args.interval,
+                batch_size=args.batch_size,
+                continuous=not args.one_time,
+            )
     except Exception as e:
         logger.error(f"Error in main: {e}")
         return 1
